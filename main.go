@@ -1,61 +1,49 @@
 package main
 
 import (
-	"io/ioutil"
+	"flag"
 	"log"
 	"net/http"
-	"net/url"
-	"strconv"
-	"time"
 
 	"github.com/ugorji/go/codec"
-	"sourcegraph.com/sourcegraph/appdash"
-	"sourcegraph.com/sourcegraph/appdash/httptrace"
-	"sourcegraph.com/sourcegraph/appdash/sqltrace"
 )
 
-func datadogTracesToAppdashThings(in []datadogSpan) (appdash.SpanID, []appdash.Event) {
-	spanID := appdash.SpanID{}
-	var events []appdash.Event
-	for _, s := range in {
-
-		log.Print("Found span of type " + s.Type)
-
-		if s.Type == "http" {
-
-			spanID.Parent = appdash.ID(s.ParentID)
-			spanID.Trace = appdash.ID(s.TraceID)
-			spanID.Span = appdash.ID(s.SpanID)
-
-			e := httptrace.ServerEvent{}
-			u, err := url.Parse(s.Meta["http.base_url"])
-			if err != nil {
-				e.Request.Host = u.Host
-			}
-			e.Request.Method = s.Meta["http.method"]
-			e.Request.URI = s.Meta["http.url"]
-			e.Request.Proto = "HTTP/1.1"
-
-			e.Response.StatusCode, _ = strconv.Atoi(s.Meta["http.status_code"])
-
-			e.ServerRecv = time.Unix(0, int64(s.Start))
-			e.ServerSend = time.Unix(0, int64(s.Start+s.Duration))
-			events = append(events, e)
-		} else if s.Type == "sql" {
-			e := sqltrace.SQLEvent{
-				SQL:        s.Resource,
-				ClientSend: time.Unix(0, int64(s.Start)),
-				ClientRecv: time.Unix(0, int64(s.Start+s.Duration)),
-			}
-			events = append(events, e)
-		}
-	}
-
-	return spanID, events
+type exporter interface {
+	Export(in []datadogSpan)
+	Flush()
 }
 
 func main() {
-	collector := appdash.NewRemoteCollector("localhost:7701")
+	appdashAddress := flag.String("appdash", "", "Address of appdash collector to use (i.e. localhost:7701). If not specified, no appdash traces will be sent")
+	exportDirectory := flag.String("dir", "", "Directory to record traces to. If not specified, traces won't be written to file")
+	jaegerServiceName := flag.String("jaeger.service", "", "The service name to report to Jaeger as")
+	jaegerCollectorAddress := flag.String("jaeger.collector", "", "The collector URL for Jaeger (e.g. http://jaeger.lan:14268/api/traces)")
+	jaegerAgentAddress := flag.String("jaeger.agent", "", "The agent address for Jaeger (e.g. jaeger.lan:6831)")
+	addr := flag.String("addr", ":12345", "The address to listen on for incoming Datadog traces")
+	flag.Parse()
+
+	var exporters []exporter
+
+	if *appdashAddress != "" {
+		exporters = append(exporters, NewRemoteAppdash(*appdashAddress))
+		log.Print("Sending traces to appdash at " + *appdashAddress)
+	}
+	if *exportDirectory != "" {
+		exporters = append(exporters, NewFileExporter(*exportDirectory))
+		log.Print("Saveing traces to local directory: " + *exportDirectory)
+	}
+	if *jaegerServiceName != "" && *jaegerCollectorAddress != "" && *jaegerAgentAddress != "" {
+		jaeger, err := NewJaegerExporter(*jaegerServiceName, *jaegerCollectorAddress, *jaegerAgentAddress)
+		if err != nil {
+			panic(err)
+		}
+		exporters = append(exporters, jaeger)
+		log.Printf("Sending traces to Jaeger instance as %q: %s / %s", *jaegerServiceName, *jaegerCollectorAddress, *jaegerAgentAddress)
+	}
+	if len(exporters) == 0 {
+		flag.Usage()
+		log.Fatal("No exporters specified")
+	}
 
 	http.HandleFunc("/v0.3/traces", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -70,12 +58,6 @@ func main() {
 			return
 		}
 
-		// Datadog-Meta-Lang-Version: 2.4.4
-		// Datadog-Meta-Tracer-Version: 0.11.2
-		// X-Datadog-Trace-Count: 1
-		// Datadog-Meta-Lang: ruby
-		// Datadog-Meta-Lang-Interpreter: ruby-x86_64-linux
-
 		msgpack := codec.MsgpackHandle{
 			RawToString: true,
 		}
@@ -87,37 +69,19 @@ func main() {
 			return
 		}
 
-		eventsSent := 0
-
-		for _, trace := range traces {
-			spanID, events := datadogTracesToAppdashThings(trace)
-			rec := appdash.NewRecorder(spanID, collector)
-			rec.Name("This is a name")
-			for _, e := range events {
-				eventsSent++
-				rec.Event(e)
+		for _, exporter := range exporters {
+			for _, trace := range traces {
+				exporter.Export(trace)
+				exporter.Flush()
 			}
-			rec.Finish()
 		}
-		log.Printf("Found %d batches, sent %d events", len(traces), eventsSent)
-		w.WriteHeader(http.StatusOK)
+
 	})
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("%s %s", r.Method, r.URL.String())
-		for k, vs := range r.Header {
-			for _, v := range vs {
-				log.Printf("  %s: %s", k, v)
-			}
-		}
-		if b, err := ioutil.ReadAll(r.Body); err != nil {
-			log.Print("Error reading body: " + err.Error())
-		} else if len(b) > 0 {
-			log.Print(">> " + string(b))
-		}
-
 		w.WriteHeader(200)
 	})
 
-	http.ListenAndServe(":12345", nil)
+	log.Println("Listing on " + *addr)
+	http.ListenAndServe(*addr, nil)
 }
